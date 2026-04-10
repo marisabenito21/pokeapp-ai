@@ -4,156 +4,170 @@ import numpy as np
 
 app = FastAPI()
 
+@app.get("/")
+def root():
+    return {"message": "API funcionando"}
 
-# ------------------------
-# 🧠 ANALYSIS FUNCTION
-# ------------------------
-def analyze_card(img):
+# ===============================
+# FUNCIONES IA
+# ===============================
 
+def detect_card(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blur, 50, 150)
 
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    if not contours:
-        return None
+    max_area = 0
+    best_rect = None
 
-    largest = max(contours, key=cv2.contourArea)
-    x, y, w, h = cv2.boundingRect(largest)
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area > max_area:
+            peri = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
 
-    card = img[y:y+h, x:x+w]
+            if len(approx) == 4:
+                max_area = area
+                best_rect = approx
 
-    gray_card = cv2.cvtColor(card, cv2.COLOR_BGR2GRAY)
-    gray_card = cv2.equalizeHist(gray_card)
+    return best_rect
 
-    # ------------------------
-    # CENTERING
-    # ------------------------
-    edges_card = cv2.Canny(gray_card, 100, 200)
 
-    col_sum = np.sum(edges_card, axis=0)
-    row_sum = np.sum(edges_card, axis=1)
+def crop_card(img, rect):
+    pts = rect.reshape(4, 2)
 
-    left_edge = np.argmax(col_sum[:w//3])
-    right_edge = np.argmax(col_sum[2*w//3:]) + 2*w//3
+    rect = np.zeros((4, 2), dtype="float32")
 
-    top_edge = np.argmax(row_sum[:h//3])
-    bottom_edge = np.argmax(row_sum[2*h//3:]) + 2*h//3
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
 
-    left = left_edge
-    right = w - right_edge
-    top = top_edge
-    bottom = h - bottom_edge
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
 
-    horiz = max(left, right) / (left + right + 1e-5)
-    vert = max(top, bottom) / (top + bottom + 1e-5)
+    (tl, tr, br, bl) = rect
 
-    centering = round((horiz + vert) / 2, 2)
+    widthA = np.linalg.norm(br - bl)
+    widthB = np.linalg.norm(tr - tl)
+    maxWidth = int(max(widthA, widthB))
 
-    # ------------------------
-    # CORNERS
-    # ------------------------
-    corner_size = int(min(w, h) * 0.08)
+    heightA = np.linalg.norm(tr - br)
+    heightB = np.linalg.norm(tl - bl)
+    maxHeight = int(max(heightA, heightB))
+
+    dst = np.array([
+        [0, 0],
+        [maxWidth - 1, 0],
+        [maxWidth - 1, maxHeight - 1],
+        [0, maxHeight - 1]], dtype="float32")
+
+    M = cv2.getPerspectiveTransform(rect, dst)
+    warp = cv2.warpPerspective(img, M, (maxWidth, maxHeight))
+
+    return warp
+
+
+def detect_corner_damage(card):
+    h, w = card.shape[:2]
+    size = int(min(w, h) * 0.1)
 
     corners = [
-        gray_card[0:corner_size, 0:corner_size],
-        gray_card[0:corner_size, w-corner_size:w],
-        gray_card[h-corner_size:h, 0:corner_size],
-        gray_card[h-corner_size:h, w-corner_size:w]
+        card[0:size, 0:size],
+        card[0:size, w-size:w],
+        card[h-size:h, 0:size],
+        card[h-size:h, w-size:w]
     ]
 
-    corner_damage = 0
+    damage_score = 0
 
-    for c in corners:
-        _, thresh = cv2.threshold(c, 200, 255, cv2.THRESH_BINARY)
-        white_ratio = np.sum(thresh == 255) / (c.size + 1e-5)
+    for corner in corners:
+        gray = cv2.cvtColor(corner, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
 
-        if white_ratio > 0.01:
-            corner_damage += white_ratio
+        white_pixels = np.sum(thresh == 255)
+        total_pixels = thresh.size
 
-    corner_damage = round(corner_damage, 3)
+        ratio = white_pixels / total_pixels
 
-    # ------------------------
-    # EDGES
-    # ------------------------
-    border = int(min(w, h) * 0.05)
+        if ratio > 0.05:
+            damage_score += 2
 
-    regions = [
-        gray_card[:, :border],
-        gray_card[:, w-border:],
-        gray_card[:border, :],
-        gray_card[h-border:, :]
-    ]
-
-    edge_damage = 0
-
-    for r in regions:
-        e = cv2.Canny(r, 50, 150)
-        edge_damage += np.sum(e > 0) / (r.size + 1e-5)
-
-    edge_damage = round(edge_damage / 4, 3)
-
-    # ------------------------
-    # SURFACE
-    # ------------------------
-    blur2 = cv2.GaussianBlur(gray_card, (9, 9), 0)
-    diff = cv2.absdiff(gray_card, blur2)
-
-    noise = round(np.sum(diff > 25) / (diff.size + 1e-5), 3)
-
-    # ------------------------
-    # SCORE POR PARTE
-    # ------------------------
-    score = 10
-    score -= abs(centering - 0.5) * 5
-    score -= corner_damage * 6
-    score -= edge_damage * 5
-    score -= noise * 3
-
-    score = round(max(0, min(10, score)), 1)
-
-    return {
-        "centering": centering,
-        "corners": corner_damage,
-        "edges": edge_damage,
-        "surface": noise,
-        "score": score
-    }
+    return damage_score
 
 
-# ------------------------
-# 🚀 ENDPOINT FINAL
-# ------------------------
+def calculate_centering(card):
+    h, w = card.shape[:2]
+
+    left = card[:, :int(w*0.1)]
+    right = card[:, int(w*0.9):]
+    top = card[:int(h*0.1), :]
+    bottom = card[int(h*0.9):, :]
+
+    left_mean = np.mean(left)
+    right_mean = np.mean(right)
+    top_mean = np.mean(top)
+    bottom_mean = np.mean(bottom)
+
+    horizontal = f"{int(left_mean)} / {int(right_mean)}"
+    vertical = f"{int(top_mean)} / {int(bottom_mean)}"
+
+    return horizontal, vertical
+
+
+def calculate_score(damage, ratio):
+    score = 10.0
+
+    score -= damage * 0.5
+
+    if ratio < 0.55 or ratio > 0.75:
+        score -= 1.5
+
+    return round(max(score, 0), 1)
+
+
+# ===============================
+# ENDPOINT
+# ===============================
+
 @app.post("/grade")
-async def grade(
-    front: UploadFile = File(...),
-    back: UploadFile = File(...)
-):
+async def grade(file: UploadFile = File(...)):
     try:
-        front_img = cv2.imdecode(np.frombuffer(await front.read(), np.uint8), cv2.IMREAD_COLOR)
-        back_img = cv2.imdecode(np.frombuffer(await back.read(), np.uint8), cv2.IMREAD_COLOR)
+        contents = await file.read()
+        npimg = np.frombuffer(contents, np.uint8)
+        img = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
 
-        front_data = analyze_card(front_img)
-        back_data = analyze_card(back_img)
+        if img is None:
+            return {"error": "Imagen inválida"}
 
-        if front_data is None or back_data is None:
-            return {"error": "No se pudo analizar una de las caras"}
+        rect = detect_card(img)
 
-        # ------------------------
-        # 🧠 FINAL SCORE
-        # ------------------------
-        base_score = front_data["score"] * 0.6 + back_data["score"] * 0.4
+        if rect is None:
+            return {
+                "card_detected": False,
+                "message": "No se detecta carta"
+            }
 
-        if abs(front_data["score"] - back_data["score"]) > 2:
-            base_score -= 0.5
+        card = crop_card(img, rect)
 
-        final_score = round(max(0, min(10, base_score)), 1)
+        h, w = card.shape[:2]
+        ratio = w / h
+
+        damage = detect_corner_damage(card)
+        cent_h, cent_v = calculate_centering(card)
+
+        score = calculate_score(damage, ratio)
 
         return {
-            "front": front_data,
-            "back": back_data,
-            "final_score": final_score
+            "card_detected": True,
+            "ratio": round(ratio, 2),
+            "corner_damage_score": int(damage),
+            "centering_horizontal": cent_h,
+            "centering_vertical": cent_v,
+            "final_score": score,
+            "message": "Grading completado"
         }
 
     except Exception as e:
